@@ -6,7 +6,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.policy import _MAX_PREFIXLEN, parse_address, parse_network
+from app.policy import (
+    MINIMIZE_POLICY_RULE_LIMIT,
+    _MAX_PREFIXLEN,
+    parse_address,
+    parse_network,
+)
 
 
 class PolicyRequest(BaseModel):
@@ -232,6 +237,90 @@ class AuditRulesResponse(BaseModel):
     )
     deny: list[RuleAuditResult] = Field(
         description="One result per deny entry, in input order.",
+    )
+
+
+class MinimizePolicyRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) limiting the minimization region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Allowed CIDR list; every entry must match the scope family."
+        ),
+    )
+    deny: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Denied CIDR list; every entry must match the scope family."
+        ),
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_rules_against_scope(self) -> "MinimizePolicyRequest":
+        # Same hard rules as /audit-rules: one family, bounded rule count.
+        scope = parse_network(self.scope)
+        total = len(self.allow) + len(self.deny)
+        if total > MINIMIZE_POLICY_RULE_LIMIT:
+            raise ValueError(
+                f"total number of allow/deny rules ({total}) exceeds the "
+                f"limit of {MINIMIZE_POLICY_RULE_LIMIT}"
+            )
+        for side, entries in (("allow", self.allow), ("deny", self.deny)):
+            for value in entries:
+                network = parse_network(value)
+                if not isinstance(network, type(scope)):
+                    raise ValueError(
+                        f"{side} CIDR {network} does not match the scope "
+                        f"address family ({scope})"
+                    )
+        return self
+
+
+class RetainedRule(RuleReference):
+    cidr: str = Field(description="Canonical CIDR of the retained rule.")
+    witness: str = Field(
+        description=(
+            "Numerically smallest IP address at which this rule wins under "
+            "the minimized policy inside the scope."
+        ),
+    )
+
+
+class RemovedRule(RuleReference):
+    cidr: str = Field(description="Canonical CIDR of the removed rule.")
+
+
+class MinimizePolicyResponse(BaseModel):
+    retained: list[RetainedRule] = Field(
+        description=(
+            "Rules kept in the unique minimum subset. References follow the "
+            "original input order: all allow entries (by index) first, then "
+            "all deny entries (by index)."
+        ),
+    )
+    removed: list[RemovedRule] = Field(
+        description=(
+            "Rules dropped by the minimization, in the same original input "
+            "order as retained: allow references by index, then deny by index."
+        ),
     )
 
 

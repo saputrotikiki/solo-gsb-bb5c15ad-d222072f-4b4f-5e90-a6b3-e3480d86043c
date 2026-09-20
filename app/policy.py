@@ -7,10 +7,12 @@ aligned with a prefix.  Pieces are merged back only when they form two
 complete, adjacent sibling prefixes (via :func:`ipaddress.collapse_addresses`),
 which yields the equivalent, non-overlapping and minimum-cardinality CIDR set.
 
-The module also hosts two scope-based consumers of the same primitives:
-``compare`` (decision diff of two policy sets inside one scope) and
-``allocate`` (lexicographically smallest non-overlapping subnet assignment
-inside one scope, avoiding occupied CIDRs).
+The module also hosts three scope-based consumers of the same primitives:
+``compare`` (decision diff of two policy sets inside one scope),
+``audit_rules`` (per-entry impact classification inside one scope) and
+``minimize_policy`` (minimum-cardinality equivalent rule subset inside one
+scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
+assignment inside one scope, avoiding occupied CIDRs).
 """
 
 from __future__ import annotations
@@ -21,6 +23,9 @@ from typing import TypeAlias, Union
 
 Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 Address: TypeAlias = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+#: Maximum total number of allow/deny rules accepted by ``/minimize-policy``.
+MINIMIZE_POLICY_RULE_LIMIT = 16
 
 # Side rank used as the second component of the match-comparison key: at equal
 # prefix length a deny entry must beat an allow entry.
@@ -622,11 +627,285 @@ def audit_rules(
 
 
 # ---------------------------------------------------------------------------
-# allocate: subnet assignment inside one scope.  Requests are fulfilled in
-# request order; among all complete feasible assignments the one whose
-# sequence of network addresses (in request order) is lexicographically
-# smallest is returned, using depth-first search with backtracking.
+# minimize-policy: smallest subset of the input rules whose decisions are
+# identical to the original policy everywhere inside one scope.  The scope is
+# partitioned into winner-constant CIDRs (no address enumeration); the subset
+# search is an exact branch-and-bound over rules (forced inclusions/exclusions,
+# most-constrained piece first), not one-by-one greedy deletion.  Ties between
+# minimum solutions are broken by the (side, index) sequence, lexicographically.
 # ---------------------------------------------------------------------------
+
+# Canonical rule ordering shared with the lex tie-break and the response:
+# allow before deny, lower original index first.
+_CANONICAL_SIDE_RANK: dict[str, int] = {"allow": 0, "deny": 1}
+
+
+def _piece_intersects_rule(piece: Network, network: Network) -> bool:
+    """Whether a partition piece intersects a rule (aligned CIDRs are laminar)."""
+    return piece == network or piece.subnet_of(network) or network.subnet_of(piece)
+
+
+def _minimize_family(
+    scope: Network,
+    rules: Sequence[tuple[int, Network, str]],
+) -> list[tuple[int, Network, str]]:
+    """Return the minimum subset of ``rules`` preserving decisions in scope.
+
+    ``rules`` are ``(original_index, network, side)`` triples sharing
+    ``scope``'s family; triples come back in the same shape.  The original
+    policy partitions the scope into winner-constant pieces.  A piece whose
+    original winner is ``None`` needs nothing (any covering rule would win
+    it, so no retained rule can cover one in the first place); every other
+    piece carries its winner side as a requirement.  A retained candidate
+    secures such a piece once every covering opposite-side rule that outranks
+    it on the piece — its blockers — is excluded: same-side rules only
+    replace the winner by another rule of the same decision and never block.
+
+    The exact DFS branches on the most constrained non-secured piece,
+    retaining one viable candidate (forcing that candidate's blockers out) or
+    committing no new rule via the exclusion-only branch of a candidate that
+    is already retained.  The distinct set of original winners is the
+    initial feasible bound; the lexicographically smallest ``(side, index)``
+    sequence among equal-cardinality solutions wins.
+    """
+    # Canonical positions double as bit positions; order matches the lex key.
+    ordered = sorted(
+        rules,
+        key=lambda rule: (_CANONICAL_SIDE_RANK[rule[2]], rule[0]),
+    )
+    total = len(ordered)
+    full_mask = (1 << total) - 1
+
+    partition = _winner_partition(scope, ordered)
+
+    # Per labelled piece: (candidate bit, blocker mask) pairs.  Candidates are
+    # covering rules of the winner side; blockers are covering opposite-side
+    # rules with a strictly higher match key on that piece.
+    piece_options: list[list[tuple[int, int]]] = []
+    ever_candidate = 0
+    for piece, winner in partition:
+        if winner is None:
+            continue
+        options: list[tuple[int, int]] = []
+        for bit, (index, network, side) in enumerate(ordered):
+            if side != winner[2] or not _piece_intersects_rule(piece, network):
+                continue
+            blockers = 0
+            candidate_key = (network.prefixlen, _SIDE_RANK[side], -index)
+            for other_bit, (other_index, other_network, other_side) in enumerate(ordered):
+                if other_side == side or not _piece_intersects_rule(
+                    piece, other_network
+                ):
+                    continue
+                other_key = (
+                    other_network.prefixlen,
+                    _SIDE_RANK[other_side],
+                    -other_index,
+                )
+                if other_key > candidate_key:
+                    blockers |= 1 << other_bit
+            options.append((1 << bit, blockers))
+            ever_candidate |= 1 << bit
+        piece_options.append(options)
+
+    # A rule that is nowhere a candidate (disjoint, or out-gunned on every
+    # labelled piece it covers) can never belong to an equivalent subset.
+    initial_excluded = full_mask & ~ever_candidate
+
+    # Feasible upper bound: the distinct original winners.  Each original
+    # winner outranks every covering opposite-side rule of its own piece, so
+    # its blocker mask there is empty and the set secures all labelled pieces.
+    winner_keys = {
+        (winner[2], winner[0])
+        for _piece, winner in partition
+        if winner is not None
+    }
+    initial_best = 0
+    for bit, (index, _network, side) in enumerate(ordered):
+        if (side, index) in winner_keys:
+            initial_best |= 1 << bit
+    best_mask = initial_best & ~initial_excluded
+
+    def lex_key(mask: int) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (ordered[bit][2], ordered[bit][0])
+            for bit in range(total)
+            if mask & (1 << bit)
+        )
+
+    def solve() -> int:
+        best = best_mask
+        visited: set[tuple[int, int]] = set()
+        stack: list[tuple[int, int]] = [(0, initial_excluded)]
+        while stack:
+            retained, excluded = stack.pop()
+            retained &= ~excluded
+            state = (retained, excluded)
+            if state in visited:
+                continue
+            visited.add(state)
+
+            # Descendants only add retained rules; a state already larger than
+            # the incumbent cannot improve cardinality.  Same-size states stay
+            # eligible: an exclusion-only completion may beat its (side,index)
+            # sequence.
+            if retained.bit_count() > best.bit_count():
+                continue
+
+            selected: tuple | None = None
+            dead = False
+            for options in piece_options:
+                viable: list[tuple[int, int]] = []
+                for candidate, blockers in options:
+                    if candidate & excluded:
+                        continue
+                    # A retained blocker can never be excluded later.
+                    if blockers & retained:
+                        continue
+                    viable.append((candidate, blockers))
+                if not viable:
+                    dead = True
+                    break
+                if any(
+                    candidate & retained and not (blockers & ~excluded)
+                    for candidate, blockers in viable
+                ):
+                    continue  # this piece is already secured
+                new_options = [
+                    (candidate, blockers)
+                    for candidate, blockers in viable
+                    if not (candidate & retained)
+                ]
+                retained_options = [
+                    (candidate, blockers)
+                    for candidate, blockers in viable
+                    if candidate & retained
+                ]
+                # Most-constrained piece first: fewest fresh candidates, then
+                # prefer one already half-committed (exclusion-only branch).
+                rank = (len(new_options), 0 if retained_options else 1)
+                if selected is None or rank < selected[0]:
+                    selected = (rank, new_options, retained_options)
+
+            if dead:
+                continue
+            if selected is None:
+                # All labelled pieces secured; drop every undecided rule.
+                if (
+                    retained.bit_count() < best.bit_count()
+                    or (
+                        retained.bit_count() == best.bit_count()
+                        and lex_key(retained) < lex_key(best)
+                    )
+                ):
+                    best = retained
+                continue
+
+            _rank, new_options, retained_options = selected
+            # Push largest canonical bit first so the smallest is popped first:
+            # a small lex incumbent prunes the rest of the search harder.
+            for candidate, blockers in sorted(
+                new_options, key=lambda item: item[0], reverse=True
+            ):
+                new_retained = retained | candidate
+                new_excluded = excluded | blockers
+                if new_retained & new_excluded:
+                    continue
+                stack.append((new_retained, new_excluded))
+            for candidate, blockers in sorted(
+                retained_options, key=lambda item: item[0], reverse=True
+            ):
+                new_excluded = excluded | blockers
+                if retained & new_excluded:
+                    continue
+                stack.append((retained, new_excluded))
+        return best
+
+    best_mask = solve()
+    return [ordered[bit] for bit in range(total) if best_mask & (1 << bit)]
+
+
+def minimize_policy(
+    scope_raw: str,
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+) -> dict:
+    """Find the smallest rule subset equivalent to the policy inside scope.
+
+    The scope is partitioned into winner-constant maximal CIDRs by
+    :func:`_winner_partition`; :func:`_minimize_family` runs the exact
+    minimum-subset search over those pieces — no address enumeration, no
+    one-by-one greedy deletion.  Ties resolve by the lexicographically
+    smallest retained ``(side, index)`` sequence (allow before deny, then
+    original list index).
+
+    The response lists retained and removed references in original input
+    order (all allow references first, then deny, each by index); every
+    retained rule carries the numerically smallest witness IP of a piece it
+    wins under the reduced policy.
+
+    Caller validation (e.g. the Pydantic schema) guarantees the scope and
+    every rule parse strictly, share one address family, and that the total
+    rule count is within :data:`MINIMIZE_POLICY_RULE_LIMIT`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+    rules: list[tuple[int, Network, str]] = [
+        (index, network, "allow")
+        for index, network in enumerate(allow_nets)
+        if isinstance(network, family)
+    ]
+    rules.extend(
+        (index, network, "deny")
+        for index, network in enumerate(deny_nets)
+        if isinstance(network, family)
+    )
+
+    retained = _minimize_family(scope, rules)
+    retained_keys = {(side, index) for index, _network, side in retained}
+
+    # Witness per retained rule from the reduced policy's own partition: in a
+    # minimum subset every retained rule wins at least one piece.
+    witness: dict[tuple[str, int], Address] = {}
+    for piece, winner in _winner_partition(scope, retained):
+        if winner is None:
+            continue
+        key = (winner[2], winner[0])
+        address = piece.network_address
+        if key not in witness or int(address) < int(witness[key]):
+            witness[key] = address
+
+    retained_refs = [
+        {
+            "side": "allow", "index": index, "cidr": str(network),
+            "witness": str(witness[("allow", index)]),
+        }
+        for index, network in enumerate(allow_nets)
+        if ("allow", index) in retained_keys
+    ]
+    retained_refs.extend(
+        {
+            "side": "deny", "index": index, "cidr": str(network),
+            "witness": str(witness[("deny", index)]),
+        }
+        for index, network in enumerate(deny_nets)
+        if ("deny", index) in retained_keys
+    )
+    removed_refs = [
+        {"side": "allow", "index": index, "cidr": str(network)}
+        for index, network in enumerate(allow_nets)
+        if ("allow", index) not in retained_keys
+    ]
+    removed_refs.extend(
+        {"side": "deny", "index": index, "cidr": str(network)}
+        for index, network in enumerate(deny_nets)
+        if ("deny", index) not in retained_keys
+    )
+
+    return {"retained": retained_refs, "removed": removed_refs}
 
 
 def _subtract_free(free: Sequence[Network], block: Network) -> list[Network]:

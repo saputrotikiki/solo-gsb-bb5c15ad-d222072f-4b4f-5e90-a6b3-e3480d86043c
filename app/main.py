@@ -1,11 +1,18 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules and /allocate."""
+/audit-rules, /minimize-policy and /allocate."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
-from app.policy import allocate, audit_rules, compare, evaluate, normalize
+from app.policy import (
+    allocate,
+    audit_rules,
+    compare,
+    evaluate,
+    minimize_policy,
+    normalize,
+)
 from app.schemas import (
     AddressDecision,
     AllocateRequest,
@@ -15,6 +22,8 @@ from app.schemas import (
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
+    MinimizePolicyRequest,
+    MinimizePolicyResponse,
     NormalizeResponse,
     PolicyRequest,
 )
@@ -27,10 +36,12 @@ app = FastAPI(
         "individual addresses against the same lists via longest-prefix "
         "match; diff two policy sets (baseline vs candidate) over a "
         "scope CIDR; audit each allow/deny rule for its real impact inside "
-        "one scope; and allocate non-overlapping subnets for a list of "
-        "requests inside one scope, avoiding already-occupied CIDRs."
+        "one scope; minimize an allow/deny list to the smallest subset "
+        "equivalent inside one scope; and allocate non-overlapping subnets "
+        "for a list of requests inside one scope, avoiding already-occupied "
+        "CIDRs."
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -302,6 +313,102 @@ def compare_policies(request: CompareRequest) -> dict:
 )
 def audit_policy_rules(request: AuditRulesRequest) -> dict:
     return audit_rules(request.scope, request.allow, request.deny)
+
+
+@app.post(
+    "/minimize-policy",
+    response_model=MinimizePolicyResponse,
+    tags=["policy"],
+    summary=(
+        "Reduce allow/deny rules to the minimum subset equivalent in a scope"
+    ),
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "minimum_subset_with_witnesses": {
+                            "summary": (
+                                "Two overlapping allows are redundant; "
+                                "lexicographically smallest (side, index) "
+                                "set is retained with witnesses"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": [
+                                    "10.0.0.0/24",
+                                    "10.0.0.0/25",
+                                ],
+                                "deny": ["10.0.0.128/25"],
+                            },
+                        },
+                        "too_many_rules": {
+                            "summary": "More than 16 rules total -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": [
+                                    "10.0.0.0/26", "10.0.0.64/26",
+                                    "10.0.0.128/26", "10.0.0.192/26",
+                                    "10.0.0.0/27", "10.0.0.32/27",
+                                    "10.0.0.64/27", "10.0.0.96/27",
+                                    "10.0.0.128/27",
+                                ],
+                                "deny": [
+                                    "10.0.0.160/27", "10.0.0.192/27",
+                                    "10.0.0.224/27", "10.0.0.0/28",
+                                    "10.0.0.16/28", "10.0.0.32/28",
+                                    "10.0.0.48/28", "10.0.0.80/28",
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "The unique minimum-cardinality rule subset, with retained "
+                "and removed references in original input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "minimum_subset_with_witnesses": {
+                            "summary": "allow index 0 covers the lower half",
+                            "value": {
+                                "retained": [
+                                    {"side": "allow", "index": 0,
+                                     "cidr": "10.0.0.0/24",
+                                     "witness": "10.0.0.0"},
+                                    {"side": "deny", "index": 0,
+                                     "cidr": "10.0.0.128/25",
+                                     "witness": "10.0.0.128"},
+                                ],
+                                "removed": [
+                                    {"side": "allow", "index": 1,
+                                     "cidr": "10.0.0.0/25"},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/rule CIDR, a rule whose address family does "
+                "not match the scope, or more than 16 allow/deny rules in "
+                "total."
+            ),
+        },
+    },
+)
+def minimize_policy_rules(request: MinimizePolicyRequest) -> dict:
+    return minimize_policy(request.scope, request.allow, request.deny)
 
 
 @app.post(

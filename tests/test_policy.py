@@ -13,6 +13,7 @@ from app.policy import (
     audit_rules,
     compare,
     evaluate,
+    minimize_policy,
     normalize,
     parse_address,
     parse_network,
@@ -921,6 +922,296 @@ def test_audit_does_not_enumerate_large_scopes():
     # Outside both entries the scope is unmatched, but both rules overlap it.
     assert all(item["status"] != "out_of_scope"
                for item in result["allow"] + result["deny"])
+
+
+# --------------------------------------------------------------------------
+# minimize-policy: minimum equivalent rule subset inside one scope
+# --------------------------------------------------------------------------
+
+_MINIMIZE_SIDE_RANK = {"allow": 0, "deny": 1}
+
+
+def test_minimize_drops_shadowed_and_out_of_scope_rules():
+    # deny /25 beats the equal-length allow /25 (index 1); the broad allow /24
+    # still wins the upper half; an out-of-scope deny is removed outright.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        ["10.0.0.0/25", "10.1.0.0/16"],
+    )
+    assert result == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.128"},
+            {"side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+             "witness": "10.0.0.0"},
+        ],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+            {"side": "deny", "index": 1, "cidr": "10.1.0.0/16"},
+        ],
+    }
+
+
+def test_minimize_lex_tie_prefers_smaller_allow_index():
+    # Both the broad allow /24 and the narrow allow /25 combine with the deny
+    # /25 into a size-2 solution; (allow, 0) wins the lexicographic tie.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        ["10.0.0.128/25"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    assert result["removed"] == [
+        {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+    ]
+
+
+def test_minimize_lex_tie_across_deny_indices():
+    # The broad deny /24 and the narrower deny /26 both keep the single deny
+    # quarter beside the two /26 allows; the earlier deny index wins.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/26", "10.0.0.128/25"],
+        ["10.0.0.0/24", "10.0.0.64/26"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("allow", 1), ("deny", 0),
+    ]
+    assert result["removed"] == [
+        {"side": "deny", "index": 1, "cidr": "10.0.0.64/26"},
+    ]
+    # Witness of the broad deny is the first quarter it actually wins under
+    # the reduced policy (0/26 allow wins the lowest quarter).
+    deny0 = next(
+        item for item in result["retained"]
+        if item["side"] == "deny" and item["index"] == 0
+    )
+    assert deny0["witness"] == "10.0.0.64"
+
+
+def test_minimize_duplicate_entries_keep_earliest_copy():
+    # Two identical denies: later copy is shadowed by the earlier one.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        [],
+        ["10.0.0.0/24", "10.0.0.0/24"],
+    )
+    assert result["retained"] == [
+        {"side": "deny", "index": 0, "cidr": "10.0.0.0/24",
+         "witness": "10.0.0.0"},
+    ]
+    assert result["removed"] == [
+        {"side": "deny", "index": 1, "cidr": "10.0.0.0/24"},
+    ]
+
+
+def test_minimize_equal_length_deny_makes_allow_fully_removable():
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.128/25"],
+        ["10.0.0.128/25"],
+    )
+    assert result["retained"] == [
+        {"side": "deny", "index": 0, "cidr": "10.0.0.128/25",
+         "witness": "10.0.0.128"},
+    ]
+    assert result["removed"] == [
+        {"side": "allow", "index": 0, "cidr": "10.0.0.128/25"},
+    ]
+
+
+def test_minimize_empty_policy_retains_nothing():
+    assert minimize_policy("10.0.0.0/24", [], []) == {
+        "retained": [], "removed": [],
+    }
+
+
+def test_minimize_references_follow_original_input_order():
+    # Allows are emitted by index before denies, in both lists.
+    result = minimize_policy(
+        "10.0.0.0/30",
+        ["10.0.0.0/32", "10.0.0.1/32", "10.0.0.2/32"],
+        ["10.0.0.3/32"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("allow", 1), ("allow", 2), ("deny", 0),
+    ]
+    assert [item["witness"] for item in result["retained"]] == [
+        "10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3",
+    ]
+    assert result["removed"] == []
+
+
+def test_minimize_ipv6_witnesses_and_huge_scope():
+    result = minimize_policy(
+        "2001:db8::/120",
+        ["2001:db8::/120"],
+        ["2001:db8::/121"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    witnesses = {
+        (item["side"], item["index"]): item["witness"]
+        for item in result["retained"]
+    }
+    assert witnesses[("allow", 0)] == "2001:db8::80"
+    assert witnesses[("deny", 0)] == "2001:db8::"
+
+    # ::/0 must complete without enumerating addresses.
+    result = minimize_policy("::/0", ["2001:db8::/32"], ["2001:db8::/48"])
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+
+
+def _minimize_brute_force(scope_raw, allow_raw, deny_raw):
+    """Reference: enumerate every subset and keep the minimum, lex-smallest."""
+    rules = [
+        (index, "allow", item) for index, item in enumerate(allow_raw)
+    ] + [
+        (index, "deny", item) for index, item in enumerate(deny_raw)
+    ]
+
+    def decisions(allow_subset, deny_subset):
+        return [
+            item["decision"]
+            for item in evaluate(allow_subset, deny_subset, _scope_addresses)
+        ]
+
+    scope = ipaddress.ip_network(scope_raw)
+    start = int(scope.network_address)
+    _scope_addresses = [
+        str(ipaddress.ip_address(start + offset))
+        for offset in range(scope.num_addresses)
+    ]
+    target = decisions(list(allow_raw), list(deny_raw))
+
+    best = None
+    for mask in range(1 << len(rules)):
+        allow_subset = [
+            cidr for pos, (_i, side, cidr) in enumerate(rules)
+            if side == "allow" and mask & (1 << pos)
+        ]
+        deny_subset = [
+            cidr for pos, (_i, side, cidr) in enumerate(rules)
+            if side == "deny" and mask & (1 << pos)
+        ]
+        if decisions(allow_subset, deny_subset) != target:
+            continue
+        key = sorted(
+            (side, index)
+            for pos, (index, side, _cidr) in enumerate(rules)
+            if mask & (1 << pos)
+        )
+        if best is None or (len(key), key) < (len(best), best):
+            best = key
+    return best
+
+
+def _assert_minimize_matches_brute_force(scope, allow, deny):
+    result = minimize_policy(scope, allow, deny)
+    retained = [
+        (item["side"], item["index"]) for item in result["retained"]
+    ]
+    assert retained == _minimize_brute_force(scope, allow, deny)
+
+    # retained + removed partition every input reference exactly once.
+    removed = [(item["side"], item["index"]) for item in result["removed"]]
+    expected = [
+        ("allow", index) for index in range(len(allow))
+    ] + [
+        ("deny", index) for index in range(len(deny))
+    ]
+    assert sorted(retained + removed) == sorted(expected)
+    # Both lists are in canonical original-input order (allow then deny).
+    assert retained == sorted(retained)
+    assert removed == sorted(removed)
+
+    # Every witness is the numerically smallest winning address of its rule
+    # under the reduced policy, checked pointwise with original indices.
+    scope_net = ipaddress.ip_network(scope)
+    reduced_entries = [
+        (item["index"], ipaddress.ip_network(
+            (allow if item["side"] == "allow" else deny)[item["index"]]
+        ), item["side"])
+        for item in result["retained"]
+    ]
+    smallest: dict[tuple[str, int], int] = {}
+    for offset in range(scope_net.num_addresses):
+        address = scope_net.network_address + offset
+        winner = None
+        for index, network, side in reduced_entries:
+            if address in network:
+                key = (network.prefixlen, _MINIMIZE_SIDE_RANK[side], -index)
+                if winner is None or key > winner[0]:
+                    winner = (key, side, index)
+        if winner is not None:
+            rule_key = (winner[1], winner[2])
+            value = int(address)
+            if rule_key not in smallest or value < smallest[rule_key]:
+                smallest[rule_key] = value
+    for item in result["retained"]:
+        key = (item["side"], item["index"])
+        assert item["witness"] == str(ipaddress.ip_address(smallest[key]))
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_minimize_matches_brute_force_ipv4(seed):
+    rng = random.Random(8000 + seed)
+    prefixlen = rng.randint(26, 29)
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 6)):
+            length = rng.randint(prefixlen - 2, 32)
+            addr = (rng.randrange(2 ** 32) >> (32 - length)) << (32 - length)
+            items.append(str(ipaddress.IPv4Network((addr, length))))
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    scope_addr = (rng.randrange(2 ** 32) >> (32 - prefixlen)) << (32 - prefixlen)
+    scope = str(ipaddress.IPv4Network((scope_addr, prefixlen)))
+    allow, deny = random_list(), random_list()
+    if len(allow) + len(deny) <= 16:
+        _assert_minimize_matches_brute_force(scope, allow, deny)
+
+
+@pytest.mark.parametrize("seed", range(32))
+def test_minimize_matches_brute_force_ipv6(seed):
+    rng = random.Random(9000 + seed)
+    prefixlen = rng.randint(122, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 5)):
+            length = rng.randint(prefixlen - 2, 128)
+            host = rng.randrange(2 ** (128 - prefixlen))
+            root = base + (host & ~((1 << (128 - prefixlen)) - 1))
+            addr = (root >> (128 - length)) << (128 - length)
+            items.append(str(ipaddress.IPv6Network((addr, length))))
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope_addr = (base + host) & ~((1 << (128 - prefixlen)) - 1)
+    scope = str(ipaddress.IPv6Network((scope_addr, prefixlen)))
+    allow, deny = random_list(), random_list()
+    if len(allow) + len(deny) <= 16:
+        _assert_minimize_matches_brute_force(scope, allow, deny)
+
+
+def test_minimize_does_not_enumerate_large_scopes():
+    # A /0 IPv6 scope completes instantly: any per-address enumeration over
+    # 2**128 addresses could not return.
+    result = minimize_policy("::/0", ["2001:db8::/32"], ["2001:db8::/48"])
+    assert len(result["retained"]) == 2
 
 
 # --------------------------------------------------------------------------
