@@ -596,6 +596,230 @@ def test_audit_rules_is_documented_in_openapi():
 
 
 # --------------------------------------------------------------------------
+# POST /minimize-policy
+# --------------------------------------------------------------------------
+
+
+def test_minimize_policy_basic_exact_minimum():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/25", "10.0.0.128/26", "10.0.0.0/24"],
+            "deny": ["10.0.0.0/26"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 2, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.64"},
+            {"side": "deny", "index": 0, "cidr": "10.0.0.0/26",
+             "witness": "10.0.0.0"},
+        ],
+        "removed": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/25"},
+            {"side": "allow", "index": 1, "cidr": "10.0.0.128/26"},
+        ],
+    }
+
+
+def test_minimize_policy_greedy_trap_broad_rule_first():
+    # Greedy deletion in input order would drop the /24 first and get stuck
+    # at size 2; the exact minimum keeps the broad allow alone.
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "10.0.0.0/25", "10.0.0.128/25"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.0"}],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+            {"side": "allow", "index": 2, "cidr": "10.0.0.128/25"}],
+    }
+
+
+def test_minimize_policy_tie_break_prefers_earlier_allow():
+    # Either allow plus the deny is a size-2 solution; the earlier allow
+    # index wins the (side, index) lexicographic tie-break.
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/25", "10.0.0.0/24"],
+            "deny": ["10.0.0.128/25"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/25",
+             "witness": "10.0.0.0"},
+            {"side": "deny", "index": 0, "cidr": "10.0.0.128/25",
+             "witness": "10.0.0.128"}],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/24"}],
+    }
+
+
+def test_minimize_policy_out_of_scope_and_unmatched_rules_removed():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/25",
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.0.0.128/25"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.0"}],
+        "removed": [
+            {"side": "deny", "index": 0, "cidr": "10.0.0.128/25"}],
+    }
+
+
+def test_minimize_policy_empty_policy():
+    response = client.post("/minimize-policy", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json() == {"retained": [], "removed": []}
+
+
+def test_minimize_policy_ipv6():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "2001:db8::/126",
+            "allow": ["2001:db8::/126", "2001:db8::3/128"],
+            "deny": ["2001:db8::3/128"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "2001:db8::/126",
+             "witness": "2001:db8::"},
+            {"side": "deny", "index": 0, "cidr": "2001:db8::3/128",
+             "witness": "2001:db8::3"}],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "2001:db8::3/128"}],
+    }
+
+
+def test_minimize_policy_accepts_exactly_16_rules():
+    # 16 disjoint /28s tile the /24: every rule is required.
+    allows = [f"10.0.0.{16 * i}/28" for i in range(16)]
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": allows},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["retained"]) == 16
+    assert data["removed"] == []
+    assert [item["witness"] for item in data["retained"]] == [
+        item["cidr"].split("/")[0] for item in data["retained"]
+    ]
+
+
+def test_minimize_policy_more_than_16_rules_returns_422():
+    allows = [f"10.0.0.{16 * i}/28" for i in range(16)]
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": allows + ["10.0.1.0/28"]},
+    )
+    assert response.status_code == 422
+    assert "16" in response.json()["detail"][0]["msg"]
+
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/25"] * 9,
+            "deny": ["10.0.0.128/25"] * 8,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_minimize_policy_family_mismatch_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "2001:db8::/32", "deny": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_minimize_policy_invalid_scope_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "bogus", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.1/24", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+    response = client.post("/minimize-policy", json={"allow": [], "deny": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_minimize_policy_invalid_rule_cidr_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "allow" for err in response.json()["detail"])
+
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "deny": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_minimize_policy_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/minimize-policy" in spec["paths"]
+    operation = spec["paths"]["/minimize-policy"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "exact_minimum_not_greedy" in examples
+    schema = spec["components"]["schemas"]["MinimizePolicyResponse"]
+    assert set(schema["properties"]) == {"retained", "removed"}
+    retained_schema = spec["components"]["schemas"]["RetainedRule"]
+    assert set(retained_schema["properties"]) == {
+        "side", "index", "cidr", "witness",
+    }
+
+
+# --------------------------------------------------------------------------
 # POST /allocate
 # --------------------------------------------------------------------------
 

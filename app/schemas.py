@@ -6,7 +6,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.policy import _MAX_PREFIXLEN, parse_address, parse_network
+from app.policy import (
+    _MAX_PREFIXLEN,
+    MINIMIZE_MAX_RULES,
+    parse_address,
+    parse_network,
+)
 
 
 class PolicyRequest(BaseModel):
@@ -232,6 +237,99 @@ class AuditRulesResponse(BaseModel):
     )
     deny: list[RuleAuditResult] = Field(
         description="One result per deny entry, in input order.",
+    )
+
+
+class MinimizePolicyRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) limiting the minimization region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    allow: list[str] = Field(
+        default_factory=list,
+        description="Allowed CIDR list; every entry must match the scope family.",
+    )
+    deny: list[str] = Field(
+        default_factory=list,
+        description="Denied CIDR list; every entry must match the scope family.",
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_against_scope(self) -> "MinimizePolicyRequest":
+        # A ValueError raised here is turned by FastAPI into an HTTP 422
+        # response, exactly like the per-field validators above.
+        scope = parse_network(self.scope)
+        for side, entries in (("allow", self.allow), ("deny", self.deny)):
+            for value in entries:
+                network = parse_network(value)
+                if not isinstance(network, type(scope)):
+                    raise ValueError(
+                        f"{side} CIDR {network} does not match the scope "
+                        f"address family ({scope})"
+                    )
+        total = len(self.allow) + len(self.deny)
+        if total > MINIMIZE_MAX_RULES:
+            raise ValueError(
+                f"too many rules: allow + deny must not exceed "
+                f"{MINIMIZE_MAX_RULES} entries, got {total}"
+            )
+        return self
+
+
+class RetainedRule(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="Input list this retained rule came from.",
+    )
+    index: int = Field(
+        description="Position of this rule in its input list (0-based).",
+    )
+    cidr: str = Field(description="Canonical CIDR of the input rule.")
+    witness: str = Field(
+        description=(
+            "Numerically smallest IP address where this rule wins under the "
+            "minimal retained rule set (inside the scope)."
+        ),
+    )
+
+
+class RemovedRule(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="Input list this removed rule came from.",
+    )
+    index: int = Field(
+        description="Position of this rule in its input list (0-based).",
+    )
+    cidr: str = Field(description="Canonical CIDR of the input rule.")
+
+
+class MinimizePolicyResponse(BaseModel):
+    retained: list[RetainedRule] = Field(
+        description=(
+            "The unique minimum rule subset, in input order (allow entries "
+            "first, then deny, indices ascending); each entry carries the "
+            "smallest witness IP where it wins under the minimal set."
+        ),
+    )
+    removed: list[RemovedRule] = Field(
+        description=(
+            "Rules dropped by the minimization, in input order (allow "
+            "entries first, then deny, indices ascending)."
+        ),
     )
 
 

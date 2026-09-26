@@ -1,11 +1,18 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules and /allocate."""
+/audit-rules, /minimize-policy and /allocate."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
-from app.policy import allocate, audit_rules, compare, evaluate, normalize
+from app.policy import (
+    allocate,
+    audit_rules,
+    compare,
+    evaluate,
+    minimize_policy,
+    normalize,
+)
 from app.schemas import (
     AddressDecision,
     AllocateRequest,
@@ -15,6 +22,8 @@ from app.schemas import (
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
+    MinimizePolicyRequest,
+    MinimizePolicyResponse,
     NormalizeResponse,
     PolicyRequest,
 )
@@ -27,10 +36,12 @@ app = FastAPI(
         "individual addresses against the same lists via longest-prefix "
         "match; diff two policy sets (baseline vs candidate) over a "
         "scope CIDR; audit each allow/deny rule for its real impact inside "
-        "one scope; and allocate non-overlapping subnets for a list of "
-        "requests inside one scope, avoiding already-occupied CIDRs."
+        "one scope; minimize the rule set to the smallest subset that keeps "
+        "every in-scope decision; and allocate non-overlapping subnets for "
+        "a list of requests inside one scope, avoiding already-occupied "
+        "CIDRs."
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -302,6 +313,85 @@ def compare_policies(request: CompareRequest) -> dict:
 )
 def audit_policy_rules(request: AuditRulesRequest) -> dict:
     return audit_rules(request.scope, request.allow, request.deny)
+
+
+@app.post(
+    "/minimize-policy",
+    response_model=MinimizePolicyResponse,
+    tags=["policy"],
+    summary="Find the minimum rule subset preserving every in-scope decision",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "exact_minimum_not_greedy": {
+                            "summary": (
+                                "Exact subset search keeps the broad allow "
+                                "and the hole-deny; the two narrower allows "
+                                "are redundant"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": [
+                                    "10.0.0.0/25",
+                                    "10.0.0.128/26",
+                                    "10.0.0.0/24",
+                                ],
+                                "deny": ["10.0.0.0/26"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "The unique minimum equivalent subset: retained and removed "
+                "rule references in input order, plus each retained rule's "
+                "smallest witness IP."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "exact_minimum_not_greedy": {
+                            "summary": "Minimum subset, (side, index) tie-break",
+                            "value": {
+                                "retained": [
+                                    {"side": "allow", "index": 2,
+                                     "cidr": "10.0.0.0/24",
+                                     "witness": "10.0.0.64"},
+                                    {"side": "deny", "index": 0,
+                                     "cidr": "10.0.0.0/26",
+                                     "witness": "10.0.0.0"},
+                                ],
+                                "removed": [
+                                    {"side": "allow", "index": 0,
+                                     "cidr": "10.0.0.0/25"},
+                                    {"side": "allow", "index": 1,
+                                     "cidr": "10.0.0.128/26"},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/rule CIDR, a rule whose address family does "
+                "not match the scope, or more than 16 allow+deny rules in "
+                "total."
+            ),
+        },
+    },
+)
+def minimize_policy_rules(request: MinimizePolicyRequest) -> dict:
+    return minimize_policy(request.scope, request.allow, request.deny)
 
 
 @app.post(

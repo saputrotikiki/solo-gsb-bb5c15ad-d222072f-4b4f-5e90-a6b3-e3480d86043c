@@ -5,7 +5,8 @@
 接收 `allow` 与 `deny` 两个 CIDR 列表，分别对 **IPv4 / IPv6** 计算集合差
 **allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
 另提供地址判定（`/evaluate`）、策略对比（`/compare`）、规则影响审计
-（`/audit-rules`）与子网分配（`/allocate`）接口。
+（`/audit-rules`）、规则最小化（`/minimize-policy`）与子网分配（`/allocate`）
+接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -15,6 +16,10 @@
 - `/audit-rules` 在单个 scope 内基于 **CIDR 分区**（不枚举地址）逐条判断
   规则为 `effective` / `shadowed` / `out_of_scope`，给出最小 witness IP 与
   使其无法获胜的规则索引集合，兼容 IPv4/IPv6；
+- `/minimize-policy` 在单个 scope 内基于同一套 **CIDR 分区**做**精确子集搜索**
+  （allow + deny 合计至多 16 条），求使 scope 内**每个地址判定与原策略一致**
+  的最少保留规则，多组最优解按保留规则的 `(side, index)` 序列字典序取唯一结果，
+  并为每条保留规则给出其在最小方案中获胜的最小 witness IP；
 - `/allocate` 在单个 scope 内为多条申请分配互不重叠、避开占用网段的子网，
   按申请顺序取**网络地址序列字典序最小**的完整可行方案（必要时回溯）；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
@@ -331,6 +336,76 @@ curl -s -X POST http://localhost:8000/audit-rules \
 `scope` 缺失/非法/主机位非零、规则 CIDR 非法，或规则与 scope 地址族不一致，
 统一返回 **HTTP 422**。
 
+### `POST /minimize-policy`
+
+在**单个 `scope` CIDR** 内，接收 allow/deny 两个列表（合计**至多 16 条**），
+寻找保留规则数最少的子集，使 scope 内**每个地址的判定都与原策略一致**
+（`allow` / `deny` / `unmatched` 全部保持不变，匹配优先级沿用 `/evaluate`：
+最长前缀 → 同长度 deny 优先 → 同列表原序优先）。
+
+求解完全基于 **CIDR 分区**：先把 scope 切成获胜者恒定的最大 CIDR 瓦片
+（与 `/audit-rules` 同一套分区原语，**不枚举任何 IP 地址**），每个瓦片对
+保留规则集形成一条约束；然后在最多 16 条规则上做**精确子集枚举**——
+按子集大小从小到大、同大小按保留规则的 `(side, index)` 序列**字典序**枚举，
+第一个满足全部约束的子集即唯一答案。**不枚举 IP，也不做逐条贪心删除**
+（贪心删除可能先丢掉宽网段、随后被两条半区规则困在非最小解）。
+
+请求体：
+
+| 字段    | 类型       | 说明                                   |
+| ------- | ---------- | -------------------------------------- |
+| `scope` | `string`   | **必填**，单个 CIDR（IPv4 或 IPv6），限定最小化区域；主机位非零返回 422 |
+| `allow` | `string[]` | 允许列表，可省略（默认 `[]`）；每条必须与 scope **同地址族** |
+| `deny`  | `string[]` | 拒绝列表，规则同 `allow`；`allow + deny` 合计**不得超过 16 条**，否则 422 |
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/minimize-policy \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "allow": [
+          "10.0.0.0/25",
+          "10.0.0.128/26",
+          "10.0.0.0/24"
+        ],
+        "deny": ["10.0.0.0/26"]
+      }'
+```
+
+响应（`retained` / `removed` 均按**原输入顺序**返回：先 allow 后 deny，
+各自按下标升序；二者恰好划分全部输入规则）：
+
+```json
+{
+  "retained": [
+    {"side": "allow", "index": 2, "cidr": "10.0.0.0/24", "witness": "10.0.0.64"},
+    {"side": "deny",  "index": 0, "cidr": "10.0.0.0/26", "witness": "10.0.0.0"}
+  ],
+  "removed": [
+    {"side": "allow", "index": 0, "cidr": "10.0.0.0/25"},
+    {"side": "allow", "index": 1, "cidr": "10.0.0.128/26"}
+  ]
+}
+```
+
+字段说明：
+
+- `retained`：唯一的最小保留子集，每条含 `side` / `index` / `cidr` 及
+  `witness`——该规则在**最小方案**中获胜区域内数值最小的 IP（分区瓦片的边界
+  地址，分区运算即可得到，不枚举地址）。上例中两条窄 allow 被删除后，宽
+  `/24` 单独在 `10.0.0.64/26` 起的多块区域获胜，故其 witness 为
+  `10.0.0.64`，而非规则自身起点 `10.0.0.0`；
+- `removed`：可安全删除的规则引用（`side` / `index` / `cidr`）。
+- 与 scope 完全不相交的规则对判定没有影响，必然出现在 `removed` 中；
+- 原策略在 scope 内处处 `unmatched`（如规则全部落在 scope 外）时最小子集为
+  空数组，`retained` 与 `removed` 均为 `[]`（没有输入规则）或仅 `removed`
+  非空（存在出界规则）。
+
+`scope` 缺失/非法/主机位非零、规则 CIDR 非法、规则与 scope **地址族不一致**，
+或 `allow + deny` **超过 16 条**，统一返回 **HTTP 422**。
+
 ### `POST /allocate`
 
 在**单个 `scope` CIDR** 内，为多条子网申请分配**互不重叠、且不触碰占用
@@ -452,6 +527,21 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
    - 否则 → `shadowed`，把各瓦片实际获胜条目的 `(side, index)` 去重收集为
      `shadowed_by`；无任何条目获胜的瓦片（`unmatched`）不贡献遮蔽者。
 
+`/minimize-policy` 复用同一套获胜者分区（`app/policy.py` 中
+`minimize_policy`），把"规则最小化"转化为分区瓦片上的精确子集搜索：
+
+1. 分区把 scope 切成互不重叠、联合穷尽 scope 的获胜者恒定 CIDR 瓦片，每块
+   记录覆盖它的全部规则（按 `/evaluate` 优先级排序）与原获胜侧；
+2. 原 `unmatched` 瓦片不被任何规则覆盖，对任意子集自动保持 `unmatched`；
+   其余每块瓦片形成一条约束：保留规则中覆盖该块、优先级最高者的 side 必须
+   等于原获胜侧（没有任何保留规则覆盖则翻成 `unmatched`，约束失败）；
+3. 在至多 16 条规则上**精确枚举所有子集**：用位掩码表示子集，先枚举
+   `size = 0,1,2,...`，同大小内按规则规范顺序（先 allow 后 deny、各自下标
+   升序）用组合枚举，第一个通过全部瓦片约束的子集既是**基数最小**解，也是
+   `(side, index)` 序列**字典序唯一**解；
+4. witness：在最小方案中，一条保留规则获胜的瓦片 = 覆盖列表里它是首个被
+   保留规则的那些瓦片；取这些瓦片网络地址的最小值，全程只有网段运算。
+
 `/allocate` 的搜索同样建立在 `scope − occupied` 的最小空闲集合之上
 （`app/policy.py` 中 `_search` / `_fits` / `_subtract_free`）：
 
@@ -489,11 +579,11 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/allocate
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、子网分配搜索（仅 ipaddress）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、规则最小子集精确搜索、子网分配搜索（仅 ipaddress）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/allocate 暴力枚举对拍）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules、/minimize-policy 逐地址对拍、/allocate 暴力枚举对拍）
 │   └── test_api.py    # API 层测试（422、409、统计、空请求等）
 ├── Dockerfile
 ├── docker-compose.yml
